@@ -1,188 +1,124 @@
-﻿using System;
+using System;
+using NAudio.Wave;
 using Util;
 
 namespace Asio
 {
     class Stream : Audio.Stream
     {
-        private struct BufferInfo
-        {
-            private ASIOBufferInfo info;
-            private ASIOSampleType type;
-
-            public ASIOBufferInfo Info { get { return info; } }
-            public ASIOSampleType Type { get { return type; } }
-
-            public BufferInfo(ASIOBufferInfo Info, ASIOSampleType Type)
-            {
-                info = Info;
-                type = Type;
-            }
-        }
+        private WaveInEvent waveIn;
+        private WaveOutEvent waveOut;
+        private BufferedWaveProvider waveOutProvider;
 
         private double sampleRate;
         public override double SampleRate { get { return sampleRate; } }
 
-        private AsioObject asio;
         private Audio.Stream.SampleHandler callback;
-        private BufferInfo[] input;
-        private BufferInfo[] output;
         private Audio.SampleBuffer[] inputBuffers;
         private Audio.SampleBuffer[] outputBuffers;
 
         private int bufferSize;
+        private int bytesPerSample;
 
-        private void OnBufferSwitch(int Index, ASIOBool Direct)
-        {
-            for (int i = 0; i < input.Length; ++i)
-                ConvertSamples(input[i].Info.buffers[Index], input[i].Type, inputBuffers[i]);
-
-            callback(bufferSize, inputBuffers, outputBuffers, sampleRate);
-
-            for (int i = 0; i < output.Length; ++i)
-                ConvertSamples(outputBuffers[i], output[i].Info.buffers[Index], output[i].Type);
-        }
-
-        private void OnSampleRateChange(double SampleRate)
-        {
-            sampleRate = SampleRate;
-        }
-
-        private int OnAsioMessage(ASIOMessageSelector selector, int value, IntPtr msg, IntPtr opt)
-        {
-            switch (selector)
-            {
-                case ASIOMessageSelector.SelectorSupported:
-                    switch ((ASIOMessageSelector)Enum.ToObject(typeof(ASIOMessageSelector), value))
-                    {
-                        case ASIOMessageSelector.EngineVersion:
-                            return 1;
-                        default:
-                            return 0;
-                    }
-                case ASIOMessageSelector.EngineVersion:
-                    return 2;
-                case ASIOMessageSelector.ResetRequest:
-                    return 1;
-                default:
-                    return 0;
-            }
-        }
-
-        private IntPtr OnBufferSwitchTimeInfo(IntPtr _params, int doubleBufferIndex, ASIOBool directProcess) { return _params; }
-
-        public Stream(Guid DeviceId, Audio.Stream.SampleHandler Callback, Channel[] Input, Channel[] Output)
+        public Stream(int DeviceIndex, bool IsInputDevice, Audio.Stream.SampleHandler Callback, Channel[] Input, Channel[] Output)
             : base(Input, Output)
         {
-            Log.Global.WriteLine(MessageType.Info, "Instantiating ASIO stream with {0} input channels and {1} output channels.", Input.Length, Output.Length);
-            asio = new AsioObject(DeviceId);
-            asio.Init(IntPtr.Zero);
+            Log.Global.WriteLine(MessageType.Info, "Instantiating NAudio stream with {0} input channels and {1} output channels.", Input.Length, Output.Length);
+
             callback = Callback;
+            sampleRate = 44100; // Default sample rate
+            bufferSize = 1024; // Default buffer size
+            bytesPerSample = 4; // 32-bit float
 
-            // Just use the driver's preferred buffer size.
-            bufferSize = asio.BufferSize.Preferred;
-
-            ASIOBufferInfo[] infos = new ASIOBufferInfo[Input.Length + Output.Length];
-            for (int i = 0; i < Input.Length; ++i)
+            // Initialize input
+            if (Input.Length > 0)
             {
-                infos[i].isInput = ASIOBool.True;
-                infos[i].channelNum = Input[i].Index;
+                waveIn = new WaveInEvent();
+                waveIn.DeviceNumber = DeviceIndex;
+                waveIn.WaveFormat = new WaveFormat((int)sampleRate, 32, Input.Length); // 32-bit float
+                waveIn.DataAvailable += WaveIn_DataAvailable;
+                waveIn.StartRecording();
+
+                inputBuffers = new Audio.SampleBuffer[Input.Length];
+                for (int i = 0; i < Input.Length; ++i)
+                {
+                    inputBuffers[i] = new Audio.SampleBuffer(bufferSize);
+                }
             }
-            for (int i = 0; i < Output.Length; ++i)
+            else
             {
-                infos[Input.Length + i].isInput = ASIOBool.False;
-                infos[Input.Length + i].channelNum = Output[i].Index;
-            }
-
-            ASIOCallbacks callbacks = new ASIOCallbacks()
-            {
-                bufferSwitch = OnBufferSwitch,
-                sampleRateDidChange = OnSampleRateChange,
-                asioMessage = OnAsioMessage,
-                bufferSwitchTimeInfo = OnBufferSwitchTimeInfo
-            };
-            asio.CreateBuffers(infos, bufferSize, callbacks);
-
-            // Create input buffers.
-            input = new BufferInfo[Input.Length];
-            inputBuffers = new Audio.SampleBuffer[Input.Length];
-            for (int i = 0; i < Input.Length; ++i)
-            {
-                input[i] = new BufferInfo(infos[i], Input[i].Type);
-                inputBuffers[i] = new Audio.SampleBuffer(bufferSize);
+                inputBuffers = new Audio.SampleBuffer[0];
             }
 
-            // Create output buffers.
-            output = new BufferInfo[Output.Length];
-            outputBuffers = new Audio.SampleBuffer[Output.Length];
-            for (int i = 0; i < Output.Length; ++i)
+            // Initialize output
+            if (Output.Length > 0)
             {
-                output[i] = new BufferInfo(infos[Input.Length + i], Output[i].Type);
-                outputBuffers[i] = new Audio.SampleBuffer(bufferSize);
+                waveOut = new WaveOutEvent();
+                waveOut.DeviceNumber = DeviceIndex;
+                waveOutProvider = new BufferedWaveProvider(new WaveFormat((int)sampleRate, 32, Output.Length)); // 32-bit float
+                waveOut.Init(waveOutProvider);
+                waveOut.Play();
+
+                outputBuffers = new Audio.SampleBuffer[Output.Length];
+                for (int i = 0; i < Output.Length; ++i)
+                {
+                    outputBuffers[i] = new Audio.SampleBuffer(bufferSize);
+                }
+            }
+            else
+            {
+                outputBuffers = new Audio.SampleBuffer[0];
+            }
+        }
+
+        private void WaveIn_DataAvailable(object sender, WaveInEventArgs e)
+        {
+            int samplesRead = e.BytesRecorded / bytesPerSample / inputBuffers.Length;
+
+            // Convert input bytes to double samples
+            for (int channel = 0; channel < inputBuffers.Length; channel++)
+            {
+                for (int i = 0; i < samplesRead; i++)
+                {
+                    // Assuming interleaved stereo: L R L R...
+                    int byteOffset = (i * inputBuffers.Length + channel) * bytesPerSample;
+                    inputBuffers[channel].Samples[i] = BitConverter.ToSingle(e.Buffer, byteOffset);
+                }
             }
 
-            sampleRate = asio.SampleRate;
+            // Call the main audio callback
+            callback(samplesRead, inputBuffers, outputBuffers, sampleRate);
 
-            asio.Start();
+            // Convert output double samples to bytes and write to output provider
+            if (outputBuffers.Length > 0)
+            {
+                byte[] outputBytes = new byte[samplesRead * outputBuffers.Length * bytesPerSample];
+                for (int channel = 0; channel < outputBuffers.Length; channel++)
+                {
+                    for (int i = 0; i < samplesRead; i++)
+                    {
+                        int byteOffset = (i * outputBuffers.Length + channel) * bytesPerSample;
+                        byte[] sampleBytes = BitConverter.GetBytes((float)outputBuffers[channel].Samples[i]);
+                        Buffer.BlockCopy(sampleBytes, 0, outputBytes, byteOffset, bytesPerSample);
+                    }
+                }
+                waveOutProvider.AddSamples(outputBytes, 0, outputBytes.Length);
+            }
         }
 
         public override void Stop()
         {
-            asio.Stop();
-            asio.DisposeBuffers();
-            asio.Dispose();
-            asio = null;
-        }
-
-        private static void ConvertSamples(Audio.SampleBuffer In, IntPtr Out, ASIOSampleType OutType)
-        {
-            switch (OutType)
+            if (waveIn != null)
             {
-                //case ASIOSampleType.Int16MSB:
-                //case ASIOSampleType.Int24MSB:
-                //case ASIOSampleType.Int32MSB:
-                //case ASIOSampleType.Float32MSB:
-                //case ASIOSampleType.Float64MSB:
-                //case ASIOSampleType.Int32MSB16:
-                //case ASIOSampleType.Int32MSB18:
-                //case ASIOSampleType.Int32MSB20:
-                //case ASIOSampleType.Int32MSB24:
-                case ASIOSampleType.Int16LSB: Audio.Util.LEf64ToLEi16(In.Raw, Out, In.Count); break;
-                //case ASIOSampleType.Int24LSB:
-                case ASIOSampleType.Int32LSB: Audio.Util.LEf64ToLEi32(In.Raw, Out, In.Count); break;
-                case ASIOSampleType.Float32LSB: Audio.Util.LEf64ToLEf32(In.Raw, Out, In.Count); break;
-                case ASIOSampleType.Float64LSB: Audio.Util.CopyMemory(Out, In.Raw, In.Count * sizeof(double)); break;
-                //case ASIOSampleType.Int32LSB16:
-                //case ASIOSampleType.Int32LSB18:
-                //case ASIOSampleType.Int32LSB20:
-                //case ASIOSampleType.Int32LSB24:
-                default: throw new NotImplementedException("Unsupported sample type");
+                waveIn.StopRecording();
+                waveIn.Dispose();
+                waveIn = null;
             }
-        }
-
-        private static void ConvertSamples(IntPtr In, ASIOSampleType InType, Audio.SampleBuffer Out)
-        {
-            switch (InType)
+            if (waveOut != null)
             {
-                //case ASIOSampleType.Int16MSB:
-                //case ASIOSampleType.Int24MSB:
-                //case ASIOSampleType.Int32MSB:
-                //case ASIOSampleType.Float32MSB:
-                //case ASIOSampleType.Float64MSB:
-                //case ASIOSampleType.Int32MSB16:
-                //case ASIOSampleType.Int32MSB18:
-                //case ASIOSampleType.Int32MSB20:
-                //case ASIOSampleType.Int32MSB24:
-                case ASIOSampleType.Int16LSB: Audio.Util.LEi16ToLEf64(In, Out.Raw, Out.Count); break;
-                //case ASIOSampleType.Int24LSB:
-                case ASIOSampleType.Int32LSB: Audio.Util.LEi32ToLEf64(In, Out.Raw, Out.Count); break;
-                case ASIOSampleType.Float32LSB: Audio.Util.LEf32ToLEf64(In, Out.Raw, Out.Count); break;
-                case ASIOSampleType.Float64LSB: Audio.Util.CopyMemory(Out.Raw, In, Out.Count * sizeof(double)); break;
-                //case ASIOSampleType.Int32LSB16:
-                //case ASIOSampleType.Int32LSB18:
-                //case ASIOSampleType.Int32LSB20:
-                //case ASIOSampleType.Int32LSB24:
-                default: throw new NotImplementedException("Unsupported sample type");
+                waveOut.Stop();
+                waveOut.Dispose();
+                waveOut = null;
             }
         }
     }

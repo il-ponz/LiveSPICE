@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Linq;
+using NAudio.Wave;
 
 namespace Asio
 {
@@ -7,44 +8,51 @@ namespace Asio
     {
         private int index;
         private string name;
-        private ASIOSampleType type;
         public int Index { get { return index; } }
         public override string Name { get { return name; } }
-        public ASIOSampleType Type { get { return type; } }
 
-        public Channel(ASIOChannelInfo Info)
+        public Channel(int Index, string Name)
         {
-            index = Info.channel;
-            name = Info.name;
-            type = Info.type;
+            index = Index;
+            name = Name;
         }
 
         public override string ToString()
         {
-            return name + " " + Enum.GetName(typeof(ASIOSampleType), type);
+            return name;
         }
     }
 
     class Device : Audio.Device
     {
-        private Guid classid;
+        private int deviceIndex;
+        private bool isInputDevice;
 
-        public Device(Guid ClassId)
+        public Device(int DeviceIndex, string DeviceName, bool IsInputDevice)
         {
-            using (AsioObject obj = new AsioObject(ClassId))
+            deviceIndex = DeviceIndex;
+            name = DeviceName;
+            isInputDevice = IsInputDevice;
+
+            // For simplicity, assume one input/output channel per device for now.
+            // NAudio's WaveInEvent/WaveOutEvent typically represent a single device.
+            if (isInputDevice)
             {
-                obj.Init(IntPtr.Zero);
-                name = obj.DriverName;
-                inputs = obj.InputChannels.Select(i => new Asio.Channel(i)).ToArray();
-                outputs = obj.OutputChannels.Select(i => new Asio.Channel(i)).ToArray();
+                inputs = new Audio.Channel[] { new Channel(0, "Input 1") };
+                outputs = new Audio.Channel[0];
             }
-            classid = ClassId;
+            else
+            {
+                inputs = new Audio.Channel[0];
+                outputs = new Audio.Channel[] { new Channel(0, "Output 1") };
+            }
         }
 
         public override Audio.Stream Open(Audio.Stream.SampleHandler Callback, Audio.Channel[] Input, Audio.Channel[] Output)
         {
             return new Stream(
-                classid,
+                deviceIndex,
+                isInputDevice,
                 Callback,
                 Input.Cast<Channel>().ToArray(),
                 Output.Cast<Channel>().ToArray());
